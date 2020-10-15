@@ -76,8 +76,9 @@ enum X86Alias : uint32_t {
 AsmParser::AsmParser(BaseEmitter* emitter) noexcept
   : _emitter(emitter),
     _currentCommandOffset(0),
-    _unknownSymbolHandler(NULL),
-    _unknownSymbolHandlerData(NULL) {}
+    _currentGlobalLabelId(Globals::kInvalidId),
+    _unknownSymbolHandler(nullptr),
+    _unknownSymbolHandlerData(nullptr) {}
 AsmParser::~AsmParser() noexcept {}
 
 // ============================================================================
@@ -107,11 +108,22 @@ static void strToLower(uint8_t* dst, const uint8_t* src, size_t size) noexcept{
 #define COMB_CHAR_4(a, b, c, d) \
   ((uint32_t(a) << 24) | (uint32_t(b) << 16) | (uint32_t(c) << 8) | uint32_t(d))
 
-static bool x86ParseRegister(Operand_& op, const uint8_t* s, size_t size) noexcept {
+static uint32_t x86RegisterCount(uint32_t archId, uint32_t regType) noexcept {
+  if (archId == Environment::kArchX86)
+    return 8;
+  else if (regType >= x86::Reg::kTypeXmm && regType <= x86::Reg::kTypeZmm)
+    return 32;
+  else
+    return 16;
+}
+
+static bool x86ParseRegister(AsmParser& parser, Operand_& op, const uint8_t* s, size_t size) noexcept {
   constexpr uint32_t kMinSize = 2;
   constexpr uint32_t kMaxSize = 5;
 
-  if (size < kMinSize || size > kMaxSize) return false;
+  if (size < kMinSize || size > kMaxSize)
+    return false;
+
   const uint8_t* sEnd = s + size;
 
   uint32_t c0 = Support::asciiToLower<uint32_t>(s[0]);
@@ -254,6 +266,11 @@ TrySpBpSiDi:
     s += 3;
     rType = x86::Reg::kTypeBnd;
   }
+  // [TMM?]
+  else if (c0 == 't' && c1 == 'm' && c2 == 'm') {
+    s += 3;
+    rType = x86::Reg::kTypeTmm;
+  }
   // [CR?]
   else if (c0 == 'c' && c1 == 'r') {
     s += 2;
@@ -270,25 +287,30 @@ TrySpBpSiDi:
 
   // Parse the register index.
   rId = uint32_t(s[0]) - '0';
-  if (rId >= 10) return false;
+  if (rId >= 10)
+    return false;
 
   if (++s < sEnd) {
     c0 = uint32_t(*s++) - '0';
-    if (c0 >= 10) return false;
+    if (c0 >= 10)
+      return false;
     rId = rId * 10 + c0;
 
     // Maximum register
-    if (rId >= 32) return false;
+    if (rId >= x86RegisterCount(parser.emitter()->arch(), rType))
+      return false;
   }
 
   // Fail if the whole input wasn't parsed.
-  if (s != sEnd) return false;
+  if (s != sEnd)
+    return false;
 
   // Fail if the register index is greater than allowed.
-  if (rId >= x86::opData.archRegs.regCount[rType]) return false;
+  if (rId >= 32)
+    return false;
 
 Done:
-  op._initReg(x86::opData.archRegs.regInfo[rType].signature(), rId);
+  op._initReg(ArchTraits::byArch(Environment::kArchX64).regTypeToSignature(rType), rId);
   return true;
 }
 
@@ -352,24 +374,68 @@ static uint32_t x86ParseSize(const uint8_t* s, size_t size) noexcept {
   return 0;
 }
 
-static Error asmHandleSymbol(AsmParser& parser, Operand_& dst, const uint8_t* name, size_t size) noexcept {
-  Label L = parser._emitter->labelByName(reinterpret_cast<const char*>(name), size);
+static Error asmHandleSymbol(AsmParser& parser, Operand_& dst, const uint8_t* name, size_t nameSize) noexcept {
+  // Resolve global/local label.
+  BaseEmitter* emitter = parser._emitter;
 
-  if (!L.isValid()) {
+  const uint8_t* localName = nullptr;
+  size_t localNameSize = 0;
+  size_t parentNameSize = nameSize;
+
+  // Don't do anything if the name starts with "..".
+  if (!(nameSize >= 2 && name[0] == '.' && name[1] == '.')) {
+    localName = static_cast<const uint8_t*>(memchr(name, '.', nameSize));
+    if (localName) {
+      parentNameSize = (size_t)(localName - name);
+      localName++;
+      localNameSize = (size_t)((name + nameSize) - localName);
+    }
+  }
+
+  Label parent;
+  Label label;
+
+  if (localName) {
+    if (name[0] == '.')
+      parent.setId(parser._currentGlobalLabelId);
+    else
+      parent = emitter->labelByName(reinterpret_cast<const char*>(name), parentNameSize);
+
+    if (parent.isValid())
+      label = emitter->labelByName(reinterpret_cast<const char*>(localName), localNameSize, parent.id());
+  }
+  else {
+    label = emitter->labelByName(reinterpret_cast<const char*>(name), nameSize, parent.id());
+  }
+
+  if (!label.isValid()) {
     if (parser._unknownSymbolHandler) {
-      Error err = parser._unknownSymbolHandler(&parser, static_cast<Operand*>(&dst), reinterpret_cast<const char*>(name), size);
-      if (err)
-        return err;
-
+      ASMJIT_PROPAGATE(parser._unknownSymbolHandler(&parser, static_cast<Operand*>(&dst), reinterpret_cast<const char*>(name), nameSize));
       if (!dst.isNone())
         return kErrorOk;
     }
 
-    L = parser._emitter->newNamedLabel(reinterpret_cast<const char*>(name), size);
-    if (!L.isValid()) return DebugUtils::errored(kErrorOutOfMemory);
+    if (localName) {
+      if (!parent.isValid()) {
+        if (!parentNameSize)
+          return DebugUtils::errored(kErrorInvalidParentLabel);
+
+        parent = emitter->newNamedLabel(reinterpret_cast<const char*>(name), parentNameSize, Label::kTypeGlobal);
+        if (!parent.isValid())
+          return DebugUtils::errored(kErrorOutOfMemory);
+      }
+      label = emitter->newNamedLabel(reinterpret_cast<const char*>(localName), localNameSize, Label::kTypeLocal, parent.id());
+      if (!label.isValid())
+        return DebugUtils::errored(kErrorOutOfMemory);
+    }
+    else {
+      label = emitter->newNamedLabel(reinterpret_cast<const char*>(name), nameSize, Label::kTypeGlobal);
+      if (!label.isValid())
+        return DebugUtils::errored(kErrorOutOfMemory);
+    }
   }
 
-  dst = L;
+  dst = label;
   return kErrorOk;
 }
 
@@ -381,7 +447,7 @@ static Error x86ParseOperand(AsmParser& parser, Operand_& dst, AsmToken* token) 
   // Symbol, could be register, memory operand size, or label.
   if (type == AsmToken::kSym) {
     // Try register.
-    if (x86ParseRegister(dst, token->data, token->size)) {
+    if (x86ParseRegister(parser, dst, token->data, token->size)) {
       if (!dst.as<x86::Reg>().isSReg())
         return kErrorOk;
 
@@ -418,7 +484,7 @@ static Error x86ParseOperand(AsmParser& parser, Operand_& dst, AsmToken* token) 
       // Parse segment prefix otherwise.
       if (type == AsmToken::kSym) {
         // Segment register.
-        if (!x86ParseRegister(seg, token->data, token->size) || !seg.as<x86::Reg>().isSReg())
+        if (!x86ParseRegister(parser, seg, token->data, token->size) || !seg.as<x86::Reg>().isSReg())
           return DebugUtils::errored(kErrorInvalidAddress);
 
         type = parser.nextToken(token);
@@ -457,17 +523,17 @@ MemOp:
         addrMode.addLowercasedChar(token->data, 2);
 
         if (addrMode.test('a', 'b', 's')) {
-          flags |= BaseMem::kSignatureMemAbs;
+          flags |= x86::Mem::kSignatureMemAbs;
           type = parser.nextToken(token);
         }
         else if (addrMode.test('r', 'e', 'l')) {
-          flags |= BaseMem::kSignatureMemRel;
+          flags |= x86::Mem::kSignatureMemRel;
           type = parser.nextToken(token);
         }
       }
     }
 
-    // Parse "[base] + [index [* scale]] + [offset]" or "[base + [offset]], [index [* scale]]" parts.
+    // Parse "[base] + [index [* scale]] + [offset]" or "[base + [offset]], [index [* scale]]".
     bool commaSeparated = false;
     uint32_t opType = AsmToken::kAdd;
 
@@ -477,7 +543,7 @@ MemOp:
           return DebugUtils::errored(kErrorInvalidAddress);
 
         Operand op;
-        if (!x86ParseRegister(op, token->data, token->size)) {
+        if (!x86ParseRegister(parser, op, token->data, token->size)) {
           // No label after 'base' is allowed.
           if (!base.isNone())
             return DebugUtils::errored(kErrorInvalidAddress);
@@ -630,6 +696,7 @@ static uint32_t x86ParseInstOption(const uint8_t* s, size_t size) noexcept {
   word.addLowercasedChar(s, 1);
   word.addLowercasedChar(s, 2);
   if (size == 3) {
+    if (word.test('b', 'n', 'd')) return x86::Inst::kOptionRepne;
     if (word.test('r', 'e', 'p')) return x86::Inst::kOptionRep;
     if (word.test('r', 'e', 'x')) return x86::Inst::kOptionRex;
     return 0;
@@ -638,22 +705,22 @@ static uint32_t x86ParseInstOption(const uint8_t* s, size_t size) noexcept {
   // Options of length '4':
   word.addLowercasedChar(s, 3);
   if (size == 4) {
-    if (word.test('l', 'o', 'c', 'k')) return x86::Inst::kOptionLock;
-    if (word.test('r', 'e', 'p', 'z')) return x86::Inst::kOptionRep;
-    if (word.test('r', 'e', 'p', 'e')) return x86::Inst::kOptionRep;
-    if (word.test('l', 'o', 'n', 'g')) return x86::Inst::kOptionLongForm;
-    if (word.test('v', 'e', 'x', '3')) return x86::Inst::kOptionVex3;
     if (word.test('e', 'v', 'e', 'x')) return x86::Inst::kOptionEvex;
+    if (word.test('l', 'o', 'c', 'k')) return x86::Inst::kOptionLock;
+    if (word.test('l', 'o', 'n', 'g')) return x86::Inst::kOptionLongForm;
+    if (word.test('r', 'e', 'p', 'e')) return x86::Inst::kOptionRep;
+    if (word.test('r', 'e', 'p', 'z')) return x86::Inst::kOptionRep;
+    if (word.test('v', 'e', 'x', '3')) return x86::Inst::kOptionVex3;
     return 0;
   }
 
   // Options of length '5':
   word.addLowercasedChar(s, 4);
   if (size == 5) {
+    if (word.test('m', 'o', 'd', 'm', 'r')) return x86::Inst::kOptionModMR;
     if (word.test('r', 'e', 'p', 'n', 'e')) return x86::Inst::kOptionRepne;
     if (word.test('r', 'e', 'p', 'n', 'z')) return x86::Inst::kOptionRepne;
     if (word.test('s', 'h', 'o', 'r', 't')) return x86::Inst::kOptionShortForm;
-    if (word.test('m', 'o', 'd', 'm', 'r')) return x86::Inst::kOptionModMR;
     return 0;
   }
 
@@ -846,7 +913,7 @@ static Error x86ParseInstruction(AsmParser& parser, uint32_t& instId, uint32_t& 
     instId = x86ParseAlias(lower, size);
     if (instId == x86::Inst::kIdNone) {
       // If that didn't work out, try to match instruction as defined by AsmJit.
-      instId = InstAPI::stringToInstId(parser.emitter()->archId(), reinterpret_cast<char*>(lower), size);
+      instId = InstAPI::stringToInstId(parser.emitter()->arch(), reinterpret_cast<char*>(lower), size);
     }
 
     if (instId == x86::Inst::kIdNone) {
@@ -958,8 +1025,8 @@ static Error x86FixupInstruction(AsmParser& parser, BaseInst& inst, Operand_* op
           case x86::Inst::kIdCmps: operands[0] = emitter->ptr_zsi(); operands[1] = emitter->ptr_zdi(); break;
           case x86::Inst::kIdMovs: operands[0] = emitter->ptr_zdi(); operands[1] = emitter->ptr_zsi(); break;
           case x86::Inst::kIdLods:
-          case x86::Inst::kIdScas: operands[0] = BaseReg(sign, x86::Gp::kIdAx); operands[1] = emitter->ptr_zdi(); break;
-          case x86::Inst::kIdStos: operands[0] = emitter->ptr_zdi(); operands[1] = BaseReg(sign, x86::Gp::kIdAx); break;
+          case x86::Inst::kIdScas: operands[0] = BaseReg::fromSignatureAndId(sign, x86::Gp::kIdAx); operands[1] = emitter->ptr_zdi(); break;
+          case x86::Inst::kIdStos: operands[0] = emitter->ptr_zdi(); operands[1] = BaseReg::fromSignatureAndId(sign, x86::Gp::kIdAx); break;
         }
       }
 
@@ -1023,9 +1090,17 @@ Error AsmParser::parseCommand() noexcept {
     tType = nextToken(&tmp);
     if (tType == AsmToken::kColon) {
       // Parse label.
-      Label dst;
-      ASMJIT_PROPAGATE(asmHandleSymbol(*this, dst, token.data, token.size));
-      ASMJIT_PROPAGATE(_emitter->bind(dst));
+      Label label;
+      ASMJIT_PROPAGATE(asmHandleSymbol(*this, label, token.data, token.size));
+      ASMJIT_PROPAGATE(_emitter->bind(label));
+
+      // Must be valid if we passed through asmHandleSymbol() and bind().
+      LabelEntry* le = _emitter->code()->labelEntry(label);
+      ASMJIT_ASSERT(le);
+
+      if (le->type() == Label::kTypeGlobal)
+        _currentGlobalLabelId = label.id();
+
       return kErrorOk;
     }
 
@@ -1062,7 +1137,7 @@ Error AsmParser::parseCommand() noexcept {
           if (tmp.u64 > maxValue)
             return DebugUtils::errored(kErrorInvalidImmediate);
 
-          db.appendString(reinterpret_cast<const char*>(tmp.valueBytes), nBytes);
+          db.append(reinterpret_cast<const char*>(tmp.valueBytes), nBytes);
 
           tType = nextToken(&tmp);
           if (tType != AsmToken::kComma)
@@ -1148,7 +1223,7 @@ Error AsmParser::parseCommand() noexcept {
                 return DebugUtils::errored(kErrorInvalidState);
 
               uint32_t maskRegId = 0;
-              uint32_t size = tmp.size;
+              size_t size = tmp.size;
               const uint8_t* str = tmp.data;
 
               if (size == 2 && (str[0] == 'k' || str[1] == 'K') && (maskRegId = (str[1] - (uint8_t)'0')) < 8) {
@@ -1206,7 +1281,7 @@ Error AsmParser::parseCommand() noexcept {
       }
 
       ASMJIT_PROPAGATE(x86FixupInstruction(*this, inst, operands, count));
-      ASMJIT_PROPAGATE(InstAPI::validate(_emitter->archId(), inst, operands, count));
+      ASMJIT_PROPAGATE(InstAPI::validate(_emitter->arch(), inst, operands, count));
 
       _emitter->setInstOptions(inst.options());
       _emitter->setExtraReg(inst.extraReg());
